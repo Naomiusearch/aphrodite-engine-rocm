@@ -5,6 +5,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Aphrodite quantization ops
   pybind11::module quant_ops = m.def_submodule("quant_ops", "Aphrodite custom quant operators");
 
+  // GGUF
+  quant_ops.def("ggml_dequantize", &ggml_dequantize, "ggml_dequantize");
+  quant_ops.def("ggml_mul_mat_vec", &ggml_mul_mat_vec, "ggml_mul_mat_vec");
+  quant_ops.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "ggml_mul_mat_vec_a8");
+  quant_ops.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "ggml_mul_mat_a8");
+
 #ifndef USE_ROCM
   // AQLM
   quant_ops.def("aqlm_gemm", &aqlm_gemm, "Quantized GEMM for AQLM");
@@ -12,11 +18,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   quant_ops.def("awq_gemm", &awq_gemm, "Quantized GEMM for AWQ");
   quant_ops.def("awq_dequantize", &awq_dequantize, "Dequantization for AWQ");
   quant_ops.def("awq_group_gemm", &awq_group_gemm, "Grouped Quantized GEMM for AWQ");
-  // GGUF
-  quant_ops.def("ggml_dequantize", &ggml_dequantize, "ggml_dequantize");
-  quant_ops.def("ggml_mul_mat_vec", &ggml_mul_mat_vec, "ggml_mul_mat_vec");
-  quant_ops.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "ggml_mul_mat_vec_a8");
-  quant_ops.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "ggml_mul_mat_a8");
   // Marlin
   quant_ops.def("marlin_gemm", &marlin_gemm, "Marlin Optimized Quantized GEMM for GPTQ");
   quant_ops.def("autoquant_convert_s4_k_m8", &autoquant_convert_s4_k_m8, "convert kernel.");

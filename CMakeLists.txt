@@ -193,7 +193,8 @@ set (APHRODITE_QUANT_EXT_SRC
   "kernels/quantization/squeezellm/quant_cuda_kernel.cu"
   "kernels/quantization/exl2/q_matrix.cu"
   "kernels/quantization/exl2/q_gemm_exl2.cu"
-  "kernels/quantization/quant_ops.cpp")
+  "kernels/quantization/quant_ops.cpp"
+  "kernels/quantization/gguf/gguf_kernel.cu")
 
 if(APHRODITE_GPU_LANG STREQUAL "CUDA")
   list(APPEND APHRODITE_QUANT_EXT_SRC
@@ -203,7 +204,6 @@ if(APHRODITE_GPU_LANG STREQUAL "CUDA")
     "kernels/quantization/bitsandbytes/int4_fp16_gemm_kernels.cu"
     "kernels/quantization/bitsandbytes/format.cu"
     "kernels/quantization/bitsandbytes/gemm_s4_f16.cu"
-    "kernels/quantization/gguf/gguf_kernel.cu"
     "kernels/quantization/marlin/marlin_cuda_kernel.cu"
     "kernels/quantization/quip/origin_order.cu")
 endif()

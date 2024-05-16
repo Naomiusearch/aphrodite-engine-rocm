@@ -15,6 +15,9 @@
 #define GGML_CUDA_DMMV_X 32
 #define GGML_CUDA_MMV_Y 1
 
+#if defined(USE_ROCM)
+#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+#endif
 
 // Data Structures
 // QK = number of values after dequantization
@@ -943,6 +946,7 @@ typedef float (*vec_dot_q_mul_mat_cuda_t)(
 #endif
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
+typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
 static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
     const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
     const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
@@ -966,11 +970,29 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 static __device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
 #if __has_builtin(__builtin_amdgcn_sdot4)
     c = __builtin_amdgcn_sdot4(a, b, c, false);
+#elif __has_builtin(__builtin_amdgcn_sudot4)
+    c = __builtin_amdgcn_sudot4( true, a, true, b, c, false);
 #else
     const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
     const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
     c += va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
 #endif
+    return c;
+}
+
+static __device__ __forceinline__ int __vsub4(const int a, const int b) {
+    return __vsubss4(a, b);
+}
+
+static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
+    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+    unsigned int c;
+    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        vc[i] = va[i] == vb[i] ? 0xff : 0x00;
+    }
     return c;
 }
 #endif // defined(USE_ROCM)
@@ -1575,16 +1597,24 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
     }
 
     // sum up partial sums and write back result
+
+#if defined(USE_ROCM) && defined(__HIP_PLATFORM_AMD__)
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        const half2 tmp_other = __shfl_xor_sync(0xffffffff, tmp, mask, 32);
+        reinterpret_cast<half&>(tmp.x) +=  __low2half(tmp_other);
+        reinterpret_cast<half&>(tmp.y) += __high2half(tmp_other);
+    }
+#else
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp = __hadd2(tmp, __shfl_xor_sync(0xffffffff, tmp, mask, 32));
     }
-
+#endif
     if (tid == 0) {
         dst[row] = __hadd(tmp.x, tmp.y);
     }
 }
-
 
 static __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx, const dfloat * __restrict__ yy, dfloat * __restrict__ dst, const int ncols, int nrows) {
 

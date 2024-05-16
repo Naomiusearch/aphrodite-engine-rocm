@@ -58,7 +58,6 @@ uintptr_t make_q_matrix(
     torch::Tensor q_group_map
 );
 
-#ifndef USE_ROCM
 // GGUF
 torch::Tensor ggml_dequantize(
     torch::Tensor X,
@@ -87,7 +86,6 @@ torch::Tensor ggml_mul_mat_a8(
     int8_t type,
     int64_t row
 );
-#endif
 
 // GPTQ
 torch::Tensor gptq_gemm(
