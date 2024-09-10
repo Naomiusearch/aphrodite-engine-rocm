@@ -10,6 +10,10 @@
 #include "mmvq.cuh"
 #include "mmq.cuh"
 
+#if defined(USE_ROCM)
+#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+#endif
+
 // Q8 gemv
 static __global__ void quantize_q8_1(const half* __restrict__ x,
                                      void* __restrict__ vy, const int kx,
