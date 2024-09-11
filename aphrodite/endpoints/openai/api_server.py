@@ -2,12 +2,12 @@ import asyncio
 import importlib
 import inspect
 import json
+import multiprocessing
 import os
 import re
 from argparse import Namespace
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from multiprocessing import Process
 from typing import AsyncGenerator, AsyncIterator, List, Set, Tuple
 
 import uvloop
@@ -45,6 +45,8 @@ from aphrodite.endpoints.openai.serving_chat import OpenAIServingChat
 from aphrodite.endpoints.openai.serving_completions import (
     OpenAIServingCompletion)
 from aphrodite.endpoints.openai.serving_embedding import OpenAIServingEmbedding
+from aphrodite.endpoints.openai.serving_engine import (LoRAModulePath,
+                                                       PromptAdapterPath)
 from aphrodite.endpoints.openai.serving_tokenization import (
     OpenAIServingTokenization)
 from aphrodite.engine.args_tools import AsyncEngineArgs
@@ -122,9 +124,15 @@ async def build_async_engine_client(args) -> AsyncIterator[AsyncEngineClient]:
         logger.info(f"Multiprocessing frontend to use {rpc_path} for RPC Path."
                     )
         # Start RPCServer in separate process (holds the AsyncAphrodite).
-        rpc_server_process = Process(target=run_rpc_server,
-                                     args=(engine_args, rpc_path))
+        context = multiprocessing.get_context("spawn")
+        # the current process might have CUDA context,
+        # so we need to spawn a new process
+        rpc_server_process = context.Process(
+            target=run_rpc_server,
+            args=(engine_args, rpc_path))
         rpc_server_process.start()
+        logger.info(
+            f"Started engine process with PID {rpc_server_process.pid}")
 
         # Build RPCClient, which conforms to AsyncEngineClient Protocol.
         async_engine_client = AsyncEngineRPCClient(rpc_path)
@@ -239,6 +247,37 @@ async def create_embedding(request: EmbeddingRequest, raw_request: Request):
                             status_code=generator.code)
     else:
         return JSONResponse(content=generator.model_dump())
+    
+
+@router.post("/v1/lora/load")
+async def load_lora(lora: LoRAModulePath):
+    openai_serving_completion.add_lora(lora)
+    if engine_args.enable_lora is False:
+        logger.error("LoRA is not enabled in the engine. "
+                     "Please start the server with the "
+                     "--enable-lora flag!")
+    return JSONResponse(content={"status": "success"})
+
+
+@router.delete("/v1/lora/unload")
+async def unload_lora(lora_name: str):
+    openai_serving_completion.remove_lora(lora_name)
+    return JSONResponse(content={"status": "success"})
+
+
+@router.post("/v1/soft_prompt/load")
+async def load_soft_prompt(soft_prompt: PromptAdapterPath):
+    openai_serving_completion.add_prompt_adapter(soft_prompt)
+    if engine_args.enable_prompt_adapter is False:
+        logger.error("Prompt Adapter is not enabled in the engine. "
+                     "Please start the server with the "
+                     "--enable-prompt-adapter flag!")
+    return JSONResponse(content={"status": "success"})
+
+@router.delete("/v1/soft_prompt/unload")
+async def unload_soft_prompt(soft_prompt_name: str):
+    openai_serving_completion.remove_prompt_adapter(soft_prompt_name)
+    return JSONResponse(content={"status": "success"})
 
 
 # ============ KoboldAI API ============ #
@@ -538,6 +577,12 @@ def build_app(args: Namespace) -> FastAPI:
 
             auth_header = request.headers.get("Authorization")
             api_key_header = request.headers.get("x-api-key")
+
+            if request.url.path.startswith(("/v1/lora", "/v1/soft_prompt")):
+                if admin_key is not None and api_key_header == admin_key:
+                    return await call_next(request)
+                return JSONResponse(content={"error": "Unauthorized"},
+                                    status_code=401)
 
             if auth_header != "Bearer " + token and api_key_header != token:
                 return JSONResponse(content={"error": "Unauthorized"},

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Iterable, Iterator, List, Optional, Tuple, TypedDict, Union
 
+from loguru import logger
 from pydantic import Field
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from typing_extensions import Annotated
@@ -197,6 +198,49 @@ class OpenAIServing:
                 return None, prompt_adapter
         # if _check_model has been called earlier, this will be unreachable
         raise ValueError(f"The model `{request.model}` does not exist.")
+    
+    def add_lora(self, lora: LoRAModulePath):
+        if lora.name in [
+                lora.lora_name for lora in self.lora_requests
+        ]:
+            logger.error(f"LoRA module {lora.name} already exists.")
+            return
+        self.lora_requests.append(
+            LoRARequest(
+                lora_name=lora.name,
+                lora_int_id=len(self.lora_requests) + 1,
+                lora_path=lora.path,
+            ))
+        
+    def remove_lora(self, lora_name: str):
+        self.lora_requests = [
+            lora for lora in self.lora_requests if lora.lora_name != lora_name
+        ]
+
+    def add_prompt_adapter(self, prompt_adapter: PromptAdapterPath):
+        if prompt_adapter.name in [
+                prompt_adapter.prompt_adapter_name
+                for prompt_adapter in self.prompt_adapter_requests
+        ]:
+            logger.error(
+                f"Prompt adapter {prompt_adapter.name} already exists.")
+            return
+        with pathlib.Path(prompt_adapter.local_path,
+                          "adapter_config.json").open() as f:
+            adapter_config = json.load(f)
+            num_virtual_tokens = adapter_config["num_virtual_tokens"]
+        self.prompt_adapter_requests.append(
+            PromptAdapterRequest(
+                prompt_adapter_name=prompt_adapter.name,
+                prompt_adapter_id=len(self.prompt_adapter_requests) + 1,
+                prompt_adapter_local_path=prompt_adapter.local_path,
+                prompt_adapter_num_virtual_tokens=num_virtual_tokens))
+        
+    def remove_prompt_adapter(self, prompt_adapter_name: str):
+        self.prompt_adapter_requests = [
+            prompt_adapter for prompt_adapter in self.prompt_adapter_requests
+            if prompt_adapter.prompt_adapter_name != prompt_adapter_name
+        ]
 
     def _normalize_prompt_text_to_input(
         self,

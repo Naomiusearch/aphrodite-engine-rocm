@@ -14,6 +14,7 @@ from xformers.ops import memory_efficient_attention
 
 from aphrodite.common.config import ModelConfig
 from aphrodite.common.sequence import SequenceData
+from aphrodite.common.utils import progress_bar
 from aphrodite.distributed import get_tensor_model_parallel_world_size
 from aphrodite.inputs import LLMInputs
 from aphrodite.modeling.layers.activation import get_act_fn
@@ -97,7 +98,13 @@ def input_processor_for_siglip(
     tokenizer = cached_get_tokenizer(model_config.tokenizer)
 
     if image_feature_size_override is None:
-        image_feature_size = get_siglip_image_feature_size(hf_config)
+        image_data = multi_modal_data["image"]
+        if isinstance(image_data, Image.Image):
+            image_feature_size = get_siglip_image_feature_size(hf_config)
+        elif isinstance(image_data, torch.Tensor):
+            image_feature_size = image_data.shape[0]
+        else:
+            raise TypeError(f"Invalid image type: {type(image_data)}")
     else:
         image_feature_size = image_feature_size_override
 
@@ -635,7 +642,9 @@ class SiglipVisionModel(nn.Module):
         params_dict = dict(self.named_parameters())
         layer_count = len(self.vision_model.encoder.layers)
 
-        for name, loaded_weight in weights:
+        weights_list = list(weights)
+        for name, loaded_weight in progress_bar(weights_list,
+                                                desc="Loading modules..."):
             # omit layers when num_hidden_layers_override is set
             if "vision_model.encoder.layers." in name:
                 layer_idx = int(name.split(".")[3])

@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The PygmalionAi team.
+# Copyright 2023 The PygmalionAI team.
 # Copyright 2023 The vLLM team.
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -21,21 +21,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Nemotron model compatible with HuggingFace weights."""
+"""Inference-only Solar model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import NemotronConfig
 
 from aphrodite.attention import Attention, AttentionMetadata
 from aphrodite.common.config import CacheConfig, LoRAConfig
 from aphrodite.common.sequence import IntermediateTensors, SamplerOutput
-from aphrodite.common.utils import progress_bar
+from aphrodite.common.utils import is_hip, progress_bar
 from aphrodite.distributed import (get_pp_group,
+                                   get_tensor_model_parallel_rank,
                                    get_tensor_model_parallel_world_size)
-from aphrodite.modeling.layers.activation import get_act_fn
-from aphrodite.modeling.layers.linear import (ColumnParallelLinear,
+from aphrodite.modeling.layers.activation import SiluAndMul
+from aphrodite.modeling.layers.layernorm import RMSNorm
+from aphrodite.modeling.layers.linear import (MergedColumnParallelLinear,
                                               QKVParallelLinear,
                                               RowParallelLinear)
 from aphrodite.modeling.layers.logits_processor import LogitsProcessor
@@ -44,56 +45,18 @@ from aphrodite.modeling.layers.sampler import Sampler
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from aphrodite.modeling.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
+    default_weight_loader, kv_cache_scales_loader, maybe_remap_kv_scale_name)
+from aphrodite.modeling.models.interfaces import SupportsLoRA
+from aphrodite.modeling.models.utils import (PPMissingLayer,
+                                             is_pp_missing_parameter,
+                                             make_layers)
 from aphrodite.modeling.sampling_metadata import SamplingMetadata
 from aphrodite.quantization.base_config import QuantizationConfig
-
-from .interfaces import SupportsLoRA
-from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
-
-# The architecture is pretty similar to Llama, with these changes:
-# - There is no gate_proj, just up_proj
-# - Normal LayerNorm (with a +1 to the weights) instead of RMSNorm
-# - Squared ReLU instead of SwiGLU
-# - Adds a rotary_percent to RoPE
+from aphrodite.quantization.compressed_tensors.utils import (
+    get_compressed_tensors_cache_scale)
 
 
-def _cast_if_autocast_enabled(*args):
-    if not torch.is_autocast_enabled():
-        return args
-    else:
-        return torch.cuda.amp.autocast_mode._cast(
-            args, torch.get_autocast_gpu_dtype())
-
-
-class NemotronLayerNorm1P(nn.LayerNorm):
-
-    def __init__(self,
-                 normalized_shape: Union[int, List[int], torch.Size],
-                 eps: float = 1e-5,
-                 elementwise_affine: bool = True,
-                 bias: bool = True,
-                 device=None,
-                 dtype=None):
-        super().__init__(normalized_shape, eps, elementwise_affine, bias,
-                         device, dtype)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if residual is not None:
-            x = x + residual
-            residual = x
-        args = _cast_if_autocast_enabled(x, self.normalized_shape,
-                                         self.weight + 1, self.bias, self.eps)
-        with torch.cuda.amp.autocast(enabled=False):
-            x = torch.nn.functional.layer_norm(*args)
-            return x if residual is None else (x, residual)
-
-
-class NemotronMLP(nn.Module):
+class SolarMLP(nn.Module):
 
     def __init__(
         self,
@@ -105,30 +68,34 @@ class NemotronMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.up_proj = ColumnParallelLinear(input_size=hidden_size,
-                                            output_size=intermediate_size,
-                                            bias=bias,
-                                            quant_config=quant_config,
-                                            prefix=f"{prefix}.up_proj")
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj")
         self.down_proj = RowParallelLinear(input_size=intermediate_size,
                                            output_size=hidden_size,
                                            bias=bias,
                                            quant_config=quant_config,
                                            prefix=f"{prefix}.down_proj")
-        self.act_fn = get_act_fn(hidden_act)
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        up, _ = self.up_proj(x)
-        x = self.act_fn(up)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-class NemotronAttention(nn.Module):
+class SolarAttention(nn.Module):
 
     def __init__(
         self,
-        config: NemotronConfig,
+        config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -163,7 +130,6 @@ class NemotronAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.rotary_percent = config.partial_rotary_factor
         self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
@@ -189,7 +155,6 @@ class NemotronAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            rotary_percent=self.rotary_percent,
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,
@@ -213,11 +178,11 @@ class NemotronAttention(nn.Module):
         return output
 
 
-class NemotronDecoderLayer(nn.Module):
+class SolarDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: NemotronConfig,
+        config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -236,7 +201,7 @@ class NemotronDecoderLayer(nn.Module):
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
-        self.self_attn = NemotronAttention(
+        self.self_attn = SolarAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -250,7 +215,7 @@ class NemotronDecoderLayer(nn.Module):
             cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = NemotronMLP(
+        self.mlp = SolarMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -258,10 +223,10 @@ class NemotronDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = NemotronLayerNorm1P(config.hidden_size,
-                                                   eps=config.norm_eps)
-        self.post_attention_layernorm = NemotronLayerNorm1P(
-            config.hidden_size, eps=config.norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -292,11 +257,11 @@ class NemotronDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class NemotronModel(nn.Module):
+class SolarModel(nn.Module):
 
     def __init__(
         self,
-        config: NemotronConfig,
+        config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
@@ -320,14 +285,13 @@ class NemotronModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: NemotronDecoderLayer(config=config,
-                                                cache_config=cache_config,
-                                                quant_config=quant_config,
-                                                prefix=prefix),
+            lambda prefix: SolarDecoderLayer(config=config,
+                                             cache_config=cache_config,
+                                             quant_config=quant_config,
+                                             prefix=prefix),
             prefix=f"{prefix}.layers")
         if get_pp_group().is_last_rank:
-            self.norm = NemotronLayerNorm1P(config.hidden_size,
-                                            eps=config.norm_eps)
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -354,7 +318,26 @@ class NemotronModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        bskcn_h_1 = None
+        bskcn_h_2 = None
+        bskcn_r_1 = None
+        bskcn_r_2 = None
+        bskcn_tv = (self.config.bskcn_tv[0] \
+                    if self.training else self.config.bskcn_tv[1])
+
         for i in range(self.start_layer, self.end_layer):
+            if i in self.config.bskcn_1:
+                bskcn_h_1 = hidden_states.clone()
+                bskcn_r_1 = residual.clone()
+            if i in self.config.bskcn_2:
+                bskcn_h_2 = hidden_states.clone()
+                bskcn_r_2 = residual.clone()
+            if i in self.config.bskcn_3:
+                hidden_states = bskcn_h_1*bskcn_tv + hidden_states*(1-bskcn_tv)
+                residual = bskcn_r_1*bskcn_tv + residual*(1-bskcn_tv)
+            if i in self.config.bskcn_4:
+                hidden_states = bskcn_h_2*bskcn_tv + hidden_states*(1-bskcn_tv)
+                residual = bskcn_r_2*bskcn_tv + residual*(1-bskcn_tv)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -374,18 +357,23 @@ class NemotronModel(nn.Module):
         return hidden_states
 
 
-class NemotronForCausalLM(nn.Module, SupportsLoRA):
+class SolarForCausalLM(nn.Module, SupportsLoRA):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
             "k_proj",
             "v_proj",
         ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
 
     # LoRA specific attributes
     supported_lora_modules = [
-        "qkv_proj", "o_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"
+        "qkv_proj", "o_proj", "gate_up_proj", "down_proj", "embed_tokens",
+        "lm_head"
     ]
     embedding_modules = {
         "embed_tokens": "input_embeddings",
@@ -397,27 +385,27 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA):
         "q_proj": ("qkv_proj", 0),
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
     }
 
     def __init__(
         self,
-        config: NemotronConfig,
+        config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
 
-        assert isinstance(config, NemotronConfig)
-
         self.config = config
         self.lora_config = lora_config
 
-        self.model = NemotronModel(config,
-                                   cache_config,
-                                   quant_config,
-                                   lora_config=lora_config,
-                                   prefix="model")
+        self.model = SolarModel(config,
+                                cache_config,
+                                quant_config,
+                                lora_config=lora_config,
+                                prefix="model")
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
@@ -455,11 +443,8 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA):
                                   attn_metadata, intermediate_tensors)
         return model_output
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
@@ -492,6 +477,8 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         weights_list = list(weights)
@@ -503,6 +490,14 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA):
                     or "rotary_emb.sin_cached" in name):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+            if scale_name := get_compressed_tensors_cache_scale(name):
+                # Loading kv cache scales for compressed-tensors quantization
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = loaded_weight[0]
+                weight_loader(param, loaded_weight)
                 continue
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
@@ -536,3 +531,28 @@ class NemotronForCausalLM(nn.Module, SupportsLoRA):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+                quantization_param_path, tp_rank, tp_size,
+                self.config.num_hidden_layers,
+                self.config.__class__.model_type):
+            if not isinstance(self.model.layers[layer_idx], nn.Identity):
+                layer_self_attn = self.model.layers[layer_idx].self_attn
+
+            if is_hip():
+                # The scaling factor convention we are assuming is
+                # quantized_value * scaling_factor ~= true_value
+                # which is consistent with the practice of setting
+                # scaling_factor = tensor_amax / FPtype_max
+                scaling_factor *= 2
+            if hasattr(layer_self_attn, "kv_scale"):
+                layer_self_attn.attn._kv_scale = scaling_factor
+            else:
+                raise RuntimeError("Self attention has no KV cache scaling "
+                                   "factor attribute!")

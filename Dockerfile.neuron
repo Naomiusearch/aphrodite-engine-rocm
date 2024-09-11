@@ -1,5 +1,5 @@
 # default base image
-ARG BASE_IMAGE="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-inference-neuronx:2.1.1-neuronx-py310-sdk2.17.0-ubuntu20.04"
+ARG BASE_IMAGE="public.ecr.aws/neuron/pytorch-inference-neuronx:2.1.2-neuronx-py310-sdk2.19.1-ubuntu20.04"
 
 FROM $BASE_IMAGE
 
@@ -32,5 +32,7 @@ ENV APHRODITE_TARGET_DEVICE="neuron"
 RUN cd /app/aphrodite-engine \
     && pip install -e . \
     && cd ..
+
+RUN pip install triton
 
 CMD ["/bin/bash"]

@@ -12,7 +12,7 @@ from aphrodite.attention import Attention, AttentionMetadata
 from aphrodite.common.config import CacheConfig, MultiModalConfig
 from aphrodite.common.sequence import (IntermediateTensors, SamplerOutput,
                                        SequenceData)
-from aphrodite.common.utils import print_warning_once
+from aphrodite.common.utils import print_warning_once, progress_bar
 from aphrodite.distributed import get_tensor_model_parallel_world_size
 from aphrodite.inputs import INPUT_REGISTRY, InputContext, LLMInputs
 from aphrodite.modeling.layers.activation import SiluAndMul
@@ -25,14 +25,16 @@ from aphrodite.modeling.layers.rotary_embedding import get_rope
 from aphrodite.modeling.layers.sampler import Sampler
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
-from aphrodite.modeling.model_loader.weight_utils import default_weight_loader
+from aphrodite.modeling.model_loader.weight_utils import (
+    default_weight_loader, row_parallel_weight_loader)
 from aphrodite.modeling.sampling_metadata import SamplingMetadata
+from aphrodite.modeling.utils import set_weight_attrs
 from aphrodite.multimodal import MULTIMODAL_REGISTRY
 from aphrodite.multimodal.image import (cached_get_tokenizer,
                                         repeat_and_pad_image_tokens)
 from aphrodite.quantization.base_config import QuantizationConfig
 
-from .interfaces import SupportsVision
+from .interfaces import SupportsMultiModal
 
 # These configs are not part of the model config but the preprocessor
 # and processor files, so we hardcode them in the model file for now.
@@ -137,6 +139,11 @@ class ChameleonLayerNorm(nn.LayerNorm):
     def __init__(self, hidden_size, *args, **kwargs):
         super().__init__(hidden_size, *args, **kwargs)
         self.normalized_shape = (hidden_size[-1], )
+
+        set_weight_attrs(self.weight,
+                         {"weight_loader": row_parallel_weight_loader})
+        set_weight_attrs(self.bias,
+                         {"weight_loader": row_parallel_weight_loader})
 
     def forward(self, hidden_states):
         hidden_states = F.layer_norm(hidden_states,
@@ -694,6 +701,8 @@ class ChameleonVQVAEEncoder(nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor):
+        pixel_values = pixel_values.to(self.conv_in.weight.dtype)
+
         # downsampling
         hidden_states = [self.conv_in(pixel_values)]
         for i_level in range(self.num_resolutions):
@@ -874,7 +883,7 @@ class ChameleonModel(nn.Module):
 @MULTIMODAL_REGISTRY.register_max_image_tokens(get_max_chameleon_image_tokens)
 @INPUT_REGISTRY.register_dummy_data(dummy_data_for_chameleon)
 @INPUT_REGISTRY.register_input_processor(input_processor_for_chameleon)
-class ChameleonForConditionalGeneration(nn.Module, SupportsVision):
+class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def __init__(
         self,
@@ -956,15 +965,19 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsVision):
                                    attn_metadata)
         return hidden_states
 
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
 
         # Disallow image tokens which does not include special
         # begin-image and end-image tokens
-        image_tokens = self.model.vocabulary_mapping.image_tokens
-        logits[:, image_tokens] = torch.finfo(logits.dtype).min
+        if logits is not None:
+            image_tokens = self.model.vocabulary_mapping.image_tokens
+            logits[:, image_tokens] = torch.finfo(logits.dtype).min
 
         return logits
 
@@ -986,7 +999,9 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsVision):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        weights_list = list(weights)
+        for name, loaded_weight in progress_bar(weights_list,
+                                                desc="Loading modules..."):
             if "rotary_emb.inv_freq" in name:
                 continue
 
