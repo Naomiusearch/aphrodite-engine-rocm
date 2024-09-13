@@ -2,8 +2,8 @@ import enum
 import json
 import os
 from dataclasses import dataclass, field, fields
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple,
-                    Type, Union)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping,
+                    Optional, Tuple, Type, Union)
 
 import torch
 from loguru import logger
@@ -68,7 +68,8 @@ class ModelConfig:
             output when `served_model_name` is not specified. 
         tokenizer: Name or path of the huggingface tokenizer to use.
         tokenizer_mode: Tokenizer mode. "auto" will use the fast tokenizer if
-            available, and "slow" will always use the slow tokenizer.
+            available, "slow" will always use the slow tokenizer, and
+            "mistral" will always use the tokenizer from `mistral_common`.
         trust_remote_code: Trust remote code (e.g., from HuggingFace) when
             downloading the model and tokenizer.
         dtype: Data type for model weights and activations. The "auto" option
@@ -237,10 +238,10 @@ class ModelConfig:
 
     def _verify_tokenizer_mode(self) -> None:
         tokenizer_mode = self.tokenizer_mode.lower()
-        if tokenizer_mode not in ["auto", "slow"]:
+        if tokenizer_mode not in ["auto", "slow", "mistral"]:
             raise ValueError(
                 f"Unknown tokenizer mode: {self.tokenizer_mode}. Must be "
-                "either 'auto' or 'slow'.")
+                "either 'auto', 'slow' or 'mistral'.")
         self.tokenizer_mode = tokenizer_mode
 
     def _verify_embedding_mode(self) -> None:
@@ -922,7 +923,8 @@ class SchedulerConfig:
                  delay_factor: float = 0.0,
                  enable_chunked_prefill: bool = False,
                  embedding_mode: Optional[bool] = False,
-                 preemption_mode: Optional[str] = None) -> None:
+                 preemption_mode: Optional[str] = None,
+                 num_scheduler_steps: int = 1) -> None:
         if max_num_batched_tokens is not None:
             self.max_num_batched_tokens = max_num_batched_tokens
         else:
@@ -951,6 +953,7 @@ class SchedulerConfig:
         self.chunked_prefill_enabled = enable_chunked_prefill
         self.embedding_mode = embedding_mode
         self.preemption_mode = preemption_mode
+        self.num_scheduler_steps = num_scheduler_steps
 
         self._verify_args()
 
@@ -976,6 +979,16 @@ class SchedulerConfig:
                 "num_lookahead_slots "
                 f"({self.num_lookahead_slots}) must be greater than or "
                 "equal to 0.")
+
+        if self.num_scheduler_steps < 1:
+            raise ValueError(
+                "num_scheduler_steps "
+                f"({self.num_scheduler_steps}) must be greater than or "
+                "equal to 1.")
+
+    @property
+    def is_multi_step(self) -> bool:
+        return self.num_scheduler_steps > 1
 
 
 class DeviceConfig:
@@ -1024,6 +1037,7 @@ class SpeculativeConfig:
         target_parallel_config: ParallelConfig,
         target_dtype: str,
         speculative_model: Optional[str],
+        speculative_model_quantization: Optional[str],
         speculative_draft_tensor_parallel_size: Optional[int],
         num_speculative_tokens: Optional[int],
         speculative_max_model_len: Optional[int],
@@ -1055,6 +1069,9 @@ class SpeculativeConfig:
             num_speculative_tokens (Optional[int]): The number of speculative
                 tokens, if provided. Will default to the number in the draft
                 model config if present, otherwise is required.
+            speculative_model_quantization (Optional[str]): Quantization method
+                that was used to quantize the speculative model weights. If
+                None, we assume the model weights are not quantized.
             speculative_draft_tensor_parallel_size (Optional[int]): The degree
                 of the tensor parallelism for the draft model.
             speculative_max_model_len (Optional[int]): The maximum model len of
@@ -1118,11 +1135,11 @@ class SpeculativeConfig:
                 "Speculative decoding requires usage of the V2 "
                 "block manager. Enable it with --use-v2-block-manager.")
 
-        # TODO: The user should be able to specify revision/quantization/max
-        # model len for the draft model. It is not currently supported.
+        # TODO: The user should be able to specify revision/max model len
+        # for the draft model. It is not currently supported.
         draft_revision = None
         draft_code_revision = None
-        draft_quantization = None
+        draft_quantization = speculative_model_quantization
 
         if speculative_model == "[ngram]":
             if ngram_prompt_lookup_min is None:
@@ -1270,7 +1287,7 @@ class SpeculativeConfig:
         elif speculative_draft_tensor_parallel_size != 1:
             # TODO: allow tp values larger than 1
             raise ValueError(
-                f"{speculative_draft_tensor_parallel_size=} cannot be"
+                f"{speculative_draft_tensor_parallel_size=} cannot be "
                 f"other value than 1")
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=target_parallel_config.
@@ -1499,10 +1516,14 @@ class PromptAdapterConfig:
 
 @dataclass
 class MultiModalConfig:
-    """Configs the input data format and how models should run for
-    multimodal models."""
+    """Controls the behavior of multimodal models."""
+
+    limit_per_prompt: Mapping[str, int]
+    """
+    The maximum number of multi-modal input instances allowed per prompt
+    for each :class:`~aphrodite.multimodal.MultiModalPlugin`.
+    """
     # TODO: Add configs to init vision tower or not.
-    pass
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

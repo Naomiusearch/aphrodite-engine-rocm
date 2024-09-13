@@ -163,7 +163,7 @@ class Detokenizer:
         seq.read_offset = read_offset
         seq.output_text += new_decoded_token_text
 
-        len(new_decoded_token_text)
+        return len(new_decoded_token_text)
 
 
 def _replace_none_with_empty(tokens: List[Optional[str]]):
@@ -231,7 +231,7 @@ def convert_prompt_ids_to_tokens(
     prefix_offset = max(
         read_offset - INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
     # This is required to guard against out-of-vocab prompt token ids
-    _replace_none_with_empty(new_tokens)
+    _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]
     return new_tokens, prefix_offset, read_offset
 
 

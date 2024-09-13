@@ -26,7 +26,8 @@ from aphrodite.endpoints.openai.protocol import (
     FunctionCall, ToolCall, UsageInfo)
 from aphrodite.endpoints.openai.serving_engine import (LoRAModulePath,
                                                        OpenAIServing,
-                                                       PromptAdapterPath)
+                                                       PromptAdapterPath,
+                                                       TextTokensPrompt)
 from aphrodite.engine.protocol import AsyncEngineClient
 from aphrodite.inputs import PromptInputs
 from aphrodite.multimodal import MultiModalDataDict
@@ -78,6 +79,16 @@ class OpenAIServingChat(OpenAIServing):
         if error_check_ret is not None:
             return error_check_ret
 
+        if request.prompt_logprobs is not None:
+            if request.stream and request.prompt_logprobs > 0:
+                return self.create_error_response(
+                    "Prompt_logprobs are not available when stream is enabled")
+
+            if request.prompt_logprobs < 0:
+                return self.create_error_response(
+                    f"Prompt_logprobs set to invalid "
+                    f"negative value: {request.prompt_logprobs}")
+
         try:
             (
                 lora_request,
@@ -124,13 +135,22 @@ class OpenAIServingChat(OpenAIServing):
             guided_decode_logits_processor = (
                 await self._guided_decode_logits_processor(request, tokenizer))
 
-            prompt_inputs = self._tokenize_prompt_input(
-                request,
-                tokenizer,
-                prompt,
-                truncate_prompt_tokens=request.truncate_prompt_tokens,
-                add_special_tokens=request.add_special_tokens,
-            )
+            if isinstance(prompt, str):
+                prompt_inputs = self._tokenize_prompt_input(
+                    request,
+                    tokenizer,
+                    prompt,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    add_special_tokens=request.add_special_tokens,
+                )
+            else:
+                assert isinstance(prompt, list) and isinstance(
+                    prompt[0], int
+                ), "Prompt has to be either a string or a list of token ids"
+                prompt_inputs = TextTokensPrompt(
+                    prompt=tokenizer.decode(prompt), prompt_token_ids=prompt)
+
+            assert prompt_inputs is not None
 
             sampling_params = request.to_sampling_params(
                 tokenizer,
@@ -486,6 +506,7 @@ class OpenAIServingChat(OpenAIServing):
             model=model_name,
             choices=choices,
             usage=usage,
+            prompt_logprobs=final_res.prompt_logprobs,
         )
 
         return response

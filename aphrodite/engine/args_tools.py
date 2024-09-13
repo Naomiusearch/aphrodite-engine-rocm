@@ -2,7 +2,8 @@ import argparse
 import dataclasses
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import (TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Type,
+                    Union)
 
 from loguru import logger
 
@@ -18,9 +19,28 @@ from aphrodite.quantization import QUANTIZATION_METHODS
 from aphrodite.transformers_utils.utils import check_gguf_file
 
 if TYPE_CHECKING:
-    from aphrodite.transformers_utils.tokenizer_group.base_tokenizer_group import (  # noqa: E501
-        BaseTokenizerGroup)
+    from aphrodite.transformers_utils.tokenizer_group import BaseTokenizerGroup
 
+
+def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
+    if len(val) == 0:
+        return None
+
+    out_dict: Dict[str, int] = {}
+    for item in val.split(","):
+        try:
+            key, value = item.split("=")
+        except TypeError as exc:
+            msg = "Each item should be in the form KEY=VALUE"
+            raise ValueError(msg) from exc
+
+        try:
+            out_dict[key] = int(value)
+        except ValueError as exc:
+            msg = f"Failed to parse value of item {key}={value}"
+            raise ValueError(msg) from exc
+
+    return out_dict
 
 @dataclass
 class EngineArgs:
@@ -28,7 +48,7 @@ class EngineArgs:
     # Model Options
     model: str
     seed: int = 0
-    served_model_name: Optional[Union[List[str]]] = None
+    served_model_name: Optional[Union[str, List[str]]] = None
     tokenizer: Optional[str] = None
     revision: Optional[str] = None
     code_revision: Optional[str] = None
@@ -50,6 +70,7 @@ class EngineArgs:
     # notice.
     tokenizer_pool_type: Union[str, Type["BaseTokenizerGroup"]] = "ray"
     tokenizer_pool_extra_config: Optional[dict] = None
+    limit_mm_per_prompt: Optional[Mapping[str, int]] = None
     max_logprobs: int = 10  # OpenAI default is 5, setting to 10 because ST
     # Device Options
     device: str = "auto"
@@ -90,9 +111,11 @@ class EngineArgs:
     guided_decoding_backend: str = 'outlines'
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: int = 256
+    num_scheduler_steps: int = 1
     # Speculative Decoding Options
     num_lookahead_slots: int = 0
     speculative_model: Optional[str] = None
+    speculative_model_quantization: Optional[str] = None
     num_speculative_tokens: Optional[int] = None
     speculative_max_model_len: Optional[int] = None
     ngram_prompt_lookup_max: Optional[int] = None
@@ -195,12 +218,11 @@ class EngineArgs:
             "--tokenizer-mode",
             type=str,
             default=EngineArgs.tokenizer_mode,
-            choices=["auto", "slow"],
-            help='Category: Model Options\n'
-            'tokenizer mode. "auto" will use the fast '
-            'tokenizer if available, and "slow" will '
-            "always use the slow tokenizer.",
-        )
+            choices=['auto', 'slow', 'mistral'],
+            help='The tokenizer mode.\n\n* "auto" will use the '
+            'fast tokenizer if available.\n* "slow" will '
+            'always use the slow tokenizer. \n* '
+            '"mistral" will always use the `mistral_common` tokenizer.')
         parser.add_argument(
             "--trust-remote-code",
             action="store_true",
@@ -299,6 +321,19 @@ class EngineArgs:
                             "This should be a JSON string that will be "
                             "parsed into a dictionary. Ignored if "
                             "tokenizer_pool_size is 0.")
+        # Multimodal related configs
+        parser.add_argument(
+            '--limit-mm-per-prompt',
+            type=nullable_kvs,
+            default=EngineArgs.limit_mm_per_prompt,
+            # The default value is given in
+            # MultiModalRegistry.init_mm_limits_per_prompt
+            help=('For each multimodal plugin, limit how many '
+                  'input instances to allow for each prompt. '
+                  'Expects a comma-separated list of items, '
+                  'e.g.: `image=16,video=2` allows a maximum of 16 '
+                  'images and 2 videos per prompt. Defaults to 1 for '
+                  'each modality.'))
         parser.add_argument(
             "--max-logprobs",
             type=int,
@@ -480,7 +515,7 @@ class EngineArgs:
             "--block-size",
             type=int,
             default=EngineArgs.block_size,
-            choices=[8, 16, 32],
+            choices=[8, 16, 32, 128, 256, 512, 1024, 2048],
             help="Category: Cache Options\n"
             "token block size",
         )
@@ -584,6 +619,11 @@ class EngineArgs:
             help="Category: API Options\n"
             "maximum number of sequences per iteration",
         )
+        parser.add_argument('--num-scheduler-steps',
+                            type=int,
+                            default=1,
+                            help=('Maximum number of forward steps per '
+                                  'scheduler call.'))
         # Speculative Decoding Options
         parser.add_argument("--num-lookahead-slots",
                             type=int,
@@ -600,6 +640,18 @@ class EngineArgs:
             default=EngineArgs.speculative_model,
             help="Category: Speculative Decoding Options\n"
             "The name of the draft model to be used in speculative decoding.")
+        # Quantization settings for speculative model.
+        parser.add_argument(
+            '--speculative-model-quantization',
+            type=str,
+            choices=[*QUANTIZATION_METHODS, None],
+            default=EngineArgs.speculative_model_quantization,
+            help='Method used to quantize the weights of speculative model.'
+            'If None, we first check the `quantization_config` '
+            'attribute in the model config file. If that is '
+            'None, we assume the model weights are not '
+            'quantized and use `dtype` to determine the data '
+            'type of the weights.')
         parser.add_argument("--num-speculative-tokens",
                             type=int,
                             default=EngineArgs.num_speculative_tokens,
@@ -818,7 +870,8 @@ class EngineArgs:
             "CPU offload space must be non-negative"
             f", but got {self.cpu_offload_gb}")
 
-        multimodal_config = MultiModalConfig()
+        multimodal_config = MultiModalConfig(
+            limit_per_prompt=self.limit_mm_per_prompt or {})
 
         device_config = DeviceConfig(device=self.device)
 
@@ -916,6 +969,8 @@ class EngineArgs:
             target_parallel_config=parallel_config,
             target_dtype=self.dtype,
             speculative_model=self.speculative_model,
+            speculative_model_quantization = \
+                self.speculative_model_quantization,
             speculative_draft_tensor_parallel_size=self.
             speculative_draft_tensor_parallel_size,
             num_speculative_tokens=self.num_speculative_tokens,
@@ -936,19 +991,35 @@ class EngineArgs:
             disable_logprobs=self.disable_logprobs_during_spec_decoding,
         )
 
+        if self.num_scheduler_steps > 1:
+            raise NotImplementedError("Multi-step is not yet supported.")
+            if speculative_config is not None:
+                raise ValueError("Speculative decoding is not supported with "
+                                 "multi-step (--num-scheduler-steps > 1)")
+            if self.enable_chunked_prefill:
+                raise ValueError("Chunked prefill is not supported with "
+                                 "multi-step (--num-scheduler-steps > 1)")
+
+        # make sure num_lookahead_slots is set the higher value depending on
+        # if we are using speculative decoding or multi-step
+        num_lookahead_slots = max(self.num_lookahead_slots,
+                                  self.num_scheduler_steps - 1)
+        num_lookahead_slots = num_lookahead_slots \
+            if speculative_config is None \
+            else speculative_config.num_lookahead_slots
+
         scheduler_config = SchedulerConfig(
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
             is_attention_free=model_config.is_attention_free(),
             use_v2_block_manager=self.use_v2_block_manager,
-            num_lookahead_slots=(self.num_lookahead_slots
-                                 if speculative_config is None else
-                                 speculative_config.num_lookahead_slots),
+            num_lookahead_slots=num_lookahead_slots,
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,
             embedding_mode=model_config.embedding_mode,
             preemption_mode=self.preemption_mode,
+            num_scheduler_steps=self.num_scheduler_steps,
         )
 
         lora_config = LoRAConfig(
