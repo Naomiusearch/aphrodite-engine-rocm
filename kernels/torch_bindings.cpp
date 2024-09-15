@@ -126,18 +126,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("awq_dequantize", &awq_dequantize);
   ops.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
-  // Dequantization for GGML.
-  ops.def("ggml_dequantize", &ggml_dequantize);
-  ops.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
-
-  // mmvq kernel for GGML.
-  ops.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8);
-  ops.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
-
-  // mmq kernel for GGML.
-  ops.def("ggml_mul_mat_a8", &ggml_mul_mat_a8);
-  ops.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
-
   // Marlin (Dense) Optimized Quantized GEMM for GPTQ.
   ops.def("marlin_gemm", &marlin_gemm);
   ops.impl("marlin_gemm", torch::kCUDA, &marlin_gemm);
@@ -198,6 +186,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("quip_decompress", torch::kCUDA, &decompress_e8p_origorder);
 #endif
 
+  // Dequantization for GGML.
+  ops.def("ggml_dequantize", &ggml_dequantize);
+  ops.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+
+  // mmvq kernel for GGML.
+  ops.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8);
+  ops.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+
+  // mmq kernel for GGML.
+  ops.def("ggml_mul_mat_a8", &ggml_mul_mat_a8);
+  ops.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+  
   // Quantized GEMM for GPTQ.
   ops.def("gptq_gemm", &gptq_gemm);
   ops.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
@@ -263,6 +263,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("dynamic_scaled_int8_quant", torch::kCUDA,
            &dynamic_scaled_int8_quant);
 
+#ifndef USE_ROCM
   // Mamba kernels
   ops.def(
       "selective_scan_fwd(Tensor! u, Tensor! delta,"
@@ -289,6 +290,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? final_states_out_,"
       "bool silu_activation) -> Tensor");
   ops.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+#endif
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

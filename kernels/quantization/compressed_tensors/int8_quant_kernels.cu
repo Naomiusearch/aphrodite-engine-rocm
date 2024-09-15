@@ -14,7 +14,11 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
   // round
   float dst = std::nearbyint(x);
   // saturate
+  #if defined(USE_ROCM)
+  dst = (dst < i8_min) ? i8_min : (i8_max < dst) ? i8_max : dst;
+  #else
   dst = std::clamp(dst, i8_min, i8_max);
+  #endif
   return static_cast<int8_t>(dst);
 #else
   // CUDA path

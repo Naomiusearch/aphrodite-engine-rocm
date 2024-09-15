@@ -62,6 +62,26 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           torch::Tensor expert_ids,
                           torch::Tensor num_tokens_post_pad);
 
+#ifndef USE_ROCM
+using fptr_t = int64_t;
+fptr_t init_custom_ar(torch::Tensor& meta, torch::Tensor& rank_data,
+                      const std::vector<std::string>& handles,
+                      const std::vector<int64_t>& offsets, int64_t rank,
+                      bool full_nvlink);
+bool should_custom_ar(torch::Tensor& inp, int64_t max_size, int64_t world_size,
+                      bool full_nvlink);
+void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
+                      torch::Tensor& out);
+void dispose(fptr_t _fa);
+int64_t meta_size();
+void register_buffer(fptr_t _fa, torch::Tensor& t,
+                     const std::vector<std::string>& handles,
+                     const std::vector<int64_t>& offsets);
+std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
+    fptr_t _fa);
+void register_graph_buffers(fptr_t _fa, const std::vector<std::string>& handles,
+                            const std::vector<std::vector<int64_t>>& offsets);
 std::vector<torch::Tensor> selective_scan_fwd(
     const torch::Tensor& u, const torch::Tensor& delta, const torch::Tensor& A,
     const torch::Tensor& B, const torch::Tensor& C,
@@ -84,25 +104,4 @@ at::Tensor causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
                              const c10::optional<at::Tensor>& initial_states_,
                              const c10::optional<at::Tensor>& final_states_out_,
                              bool silu_activation);
-
-#ifndef USE_ROCM
-using fptr_t = int64_t;
-fptr_t init_custom_ar(torch::Tensor& meta, torch::Tensor& rank_data,
-                      const std::vector<std::string>& handles,
-                      const std::vector<int64_t>& offsets, int64_t rank,
-                      bool full_nvlink);
-bool should_custom_ar(torch::Tensor& inp, int64_t max_size, int64_t world_size,
-                      bool full_nvlink);
-void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
-void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
-                      torch::Tensor& out);
-void dispose(fptr_t _fa);
-int64_t meta_size();
-void register_buffer(fptr_t _fa, torch::Tensor& t,
-                     const std::vector<std::string>& handles,
-                     const std::vector<int64_t>& offsets);
-std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
-    fptr_t _fa);
-void register_graph_buffers(fptr_t _fa, const std::vector<std::string>& handles,
-                            const std::vector<std::vector<int64_t>>& offsets);
 #endif
