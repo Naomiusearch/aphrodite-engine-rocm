@@ -57,6 +57,14 @@ torch::Tensor dequant_gptq(torch::Tensor b_q_weight,
                            torch::Tensor b_gptq_scales, torch::Tensor b_g_idx,
                            int64_t bits, bool use_exllama);
 
+// ExLlamav2
+torch::Tensor exl2_gemm(torch::Tensor a, uintptr_t b);
+
+uintptr_t make_q_matrix(torch::Tensor q_weight, torch::Tensor q_perm,
+                        torch::Tensor q_invperm, torch::Tensor q_scale,
+                        torch::Tensor q_scale_max, torch::Tensor q_groups,
+                        torch::Tensor q_group_map);
+
 #ifndef USE_ROCM
 // Marlin
 torch::Tensor marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,

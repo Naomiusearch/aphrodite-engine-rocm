@@ -180,6 +180,8 @@ set(APHRODITE_EXT_SRC
   "kernels/layernorm_kernels.cu"
   "kernels/quantization/squeezellm/quant_cuda_kernel.cu"
   "kernels/quantization/gptq/q_gemm.cu"
+  "kernels/quantization/exl2/q_matrix.cu"
+  "kernels/quantization/exl2/q_gemm_exl2.cu"
   "kernels/quantization/compressed_tensors/int8_quant_kernels.cu"
   "kernels/quantization/fp8/common.cu"
   "kernels/cuda_utils_kernels.cu"

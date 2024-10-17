@@ -215,6 +215,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+  // Preprocess for EXL2
+  ops.def("exl2_make_q_matrix", &make_q_matrix);
+  ops.impl("exl2_make_q_matrix", torch::kCUDA, &make_q_matrix);
+
+  //EXL2 gemm
+  ops.def("exl2_gemm", &exl2_gemm);
+  ops.impl("&exl2_gemm", torch::kCUDA, &exl2_gemm);
   // Quantized GEMM for SqueezeLLM.
   ops.def(
       "squeezellm_gemm(Tensor vec, Tensor mat, Tensor! mul, Tensor "
