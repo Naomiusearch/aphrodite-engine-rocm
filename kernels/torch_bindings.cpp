@@ -226,6 +226,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp_eXmY_linear_forward_cuda", torch::kCUDA,
            &fp_eXmY_linear_forward_cuda);
 
+#endif
+
   // Sampling Kernels
   ops.def("sampling_from_probs", &sampling_from_probs);
   ops.impl("sampling_from_probs", torch::kCUDA, &sampling_from_probs);
@@ -248,7 +250,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("top_k_mask_logits", &top_k_mask_logits);
   ops.impl("top_k_mask_logits", torch::kCUDA, &top_k_mask_logits);
 
-#endif
 
   // Quantized GEMM for GPTQ.
   ops.def("gptq_gemm", &gptq_gemm);

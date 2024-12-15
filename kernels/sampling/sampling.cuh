@@ -17,9 +17,17 @@
 #ifndef APHRODITE_SAMPLING_CUH_
 #define APHRODITE_SAMPLING_CUH_
 
+#ifdef USE_ROCM
+#include <hipcub/hipcub.hpp>
+#include <hipcub/block/block_adjacent_difference.hpp>
+#include <hipcub/block/block_reduce.hpp>
+#include <hipcub/block/block_scan.hpp>
+#else
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+#endif
+
 #include <numeric>
 
 #include "math.cuh"

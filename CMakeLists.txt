@@ -199,7 +199,8 @@ set(APHRODITE_EXT_SRC
   "kernels/cuda_utils_kernels.cu"
   "kernels/moe/align_block_size_kernel.cu"
   "kernels/prepare_inputs/advance_step.cu"
-  "kernels/torch_bindings.cpp")
+  "kernels/torch_bindings.cpp"
+  "kernels/sampling/sampling.cu")
 
 if(APHRODITE_GPU_LANG STREQUAL "CUDA")
   list(APPEND APHRODITE_EXT_SRC
@@ -218,8 +219,7 @@ if(APHRODITE_GPU_LANG STREQUAL "CUDA")
     "kernels/quantization/gptq_marlin/awq_marlin_repack.cu"
     "kernels/quantization/fp8/fp8_marlin.cu"
     "kernels/all_reduce/custom_all_reduce.cu"
-    "kernels/permute_cols.cu"
-    "kernels/sampling/sampling.cu")
+    "kernels/permute_cols.cu")
 
   if(NOT MSVC)
     # Include CUTLASS only when needed

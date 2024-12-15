@@ -19,7 +19,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifdef USE_ROCM
+#include "../quantization/fp8/amd/quant_utils.cuh"
+#else
 #include <cuda_fp8.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <type_traits>

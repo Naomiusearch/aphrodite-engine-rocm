@@ -105,6 +105,8 @@ at::Tensor causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
 
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 
+#endif
+
 // Sampling kernels
 torch::Tensor sampling_from_probs(torch::Tensor probs,
                                   torch::Tensor uniform_samples,
@@ -135,5 +137,3 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs,
 torch::Tensor top_k_mask_logits(torch::Tensor logits,
                                 std::optional<torch::Tensor> maybe_top_k_arr,
                                 int64_t top_k_val);
-
-#endif

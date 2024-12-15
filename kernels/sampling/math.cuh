@@ -19,6 +19,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(USE_ROCM)
+#define __shfl_xor_sync(mask, var, laneMask) __shfl_xor(var, laneMask)
+#endif
 
 namespace aphrodite {
 namespace math {
