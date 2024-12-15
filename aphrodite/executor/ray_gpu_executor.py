@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import msgspec
 from loguru import logger
 
-from aphrodite import envs
+import aphrodite.common.envs as envs
 from aphrodite.common.sequence import ExecuteModelRequest, SamplerOutput
 from aphrodite.common.utils import (_run_task_with_lock,
                                     get_aphrodite_instance_id,
@@ -225,6 +225,18 @@ class RayGPUExecutor(DistributedGPUExecutor):
             node_gpus[node_id].extend(gpu_ids)
         for node_id, gpu_ids in node_gpus.items():
             node_gpus[node_id] = sorted(gpu_ids)
+
+        all_ips = set(worker_ips + [driver_ip])
+        n_ips = len(all_ips)
+        n_nodes = len(node_workers)
+        if n_nodes != n_ips:
+            raise RuntimeError(
+                f"Every node should have a unique IP address. Got {n_nodes}"
+                f" nodes with node ids {list(node_workers.keys())} and "
+                f"{n_ips} unique IP addresses {all_ips}. Please check your"
+                " network configuration. If you set `APHRODITE_HOST_IP` or "
+                "`HOST_IP` environment variable, make sure it is unique for"
+                " each node.")
 
         APHRODITE_INSTANCE_ID = get_aphrodite_instance_id()
 
