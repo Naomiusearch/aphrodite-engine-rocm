@@ -1,15 +1,16 @@
 from contextlib import contextmanager
-from typing import ClassVar, List, Optional, Sequence, Union, cast, overload
+from typing import (Any, ClassVar, Dict, List, Optional, Sequence, Union, cast,
+                    overload)
 
 from tqdm import tqdm
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from aphrodite.common.outputs import EmbeddingRequestOutput, RequestOutput
 from aphrodite.common.pooling_params import PoolingParams
-from aphrodite.common.sampling_params import SamplingParams
-from aphrodite.common.utils import Counter, deprecate_kwargs
+from aphrodite.common.sampling_params import RequestOutputKind, SamplingParams
+from aphrodite.common.utils import Counter, deprecate_kwargs, is_list_of
 from aphrodite.endpoints.chat_utils import (ChatCompletionMessageParam,
-                                            apply_chat_template,
+                                            apply_hf_chat_template,
+                                            apply_mistral_chat_template,
                                             parse_chat_messages)
 from aphrodite.engine.aphrodite_engine import AphroditeEngine
 from aphrodite.engine.args_tools import EngineArgs
@@ -20,7 +21,10 @@ from aphrodite.modeling.guided_decoding import (
     GuidedDecodingRequest, get_local_guided_decoding_logits_processor)
 from aphrodite.modeling.guided_decoding.guided_fields import LLMGuidedOptions
 from aphrodite.prompt_adapter.request import PromptAdapterRequest
-from aphrodite.transformers_utils.tokenizer import get_cached_tokenizer
+from aphrodite.transformers_utils.tokenizer import (AnyTokenizer,
+                                                    MistralTokenizer,
+                                                    get_cached_tokenizer)
+from aphrodite.transformers_utils.tokenizer_group import TokenizerGroup
 
 
 class LLM:
@@ -50,7 +54,7 @@ class LLM:
             However, if the `torch_dtype` in the config is `float32`, we will
             use `float16` instead.
         quantization: The method used to quantize the model weights. Currently,
-            we support "awq", "gptq", "squeezellm", and "fp8" (experimental).
+            we support "awq", "gptq", and "fp8" (experimental).
             If None, we first check the `quantization_config` attribute in the
             model config file. If that is None, we assume the model weights are
             not quantized and use `dtype` to determine the data type of
@@ -82,11 +86,13 @@ class LLM:
             to eager mode (DEPRECATED. Use `max_seq_len_to_capture` instead).
         max_seq_len_to_capture: Maximum sequence len covered by CUDA graphs.
             When a sequence has context length larger than this, we fall back
-            to eager mode.
+            to eager mode. Additionally for encoder-decoder models, if the
+            sequence length of the encoder input is larger than this, we fall
+            back to the eager mode.
         disable_custom_all_reduce: See ParallelConfig
         **kwargs: Arguments for :class:`~aphrodite.EngineArgs`. (See
             :ref:`engine_args`)
-    
+
     Note:
         This class is intended to be used for offline inference. For online
         serving, use the :class:`~aphrodite.AsyncAphrodite` class instead.
@@ -118,25 +124,30 @@ class LLM:
         tokenizer_revision: Optional[str] = None,
         seed: int = 0,
         gpu_memory_utilization: float = 0.9,
-        swap_space: int = 4,
+        swap_space: float = 4,
         cpu_offload_gb: float = 0,
         enforce_eager: Optional[bool] = None,
         max_context_len_to_capture: Optional[int] = None,
         max_seq_len_to_capture: int = 8192,
         disable_custom_all_reduce: bool = False,
+        disable_async_output_proc: bool = False,
         **kwargs,
     ) -> None:
         '''
         LLM constructor.
+
         Note: if enforce_eager is unset (enforce_eager is None)
-        it defaults to False for decoder-only models and True
-        for encoder/decoder models, since encoder/decoder models
-        do not currently support CUDAGraph.
+        it defaults to False.
         '''
+
         if "disable_log_stats" not in kwargs:
             kwargs["disable_log_stats"] = True
-        removed_vision_keys = ("image_token_id", "image_feature_size",
-                               "image_input_shape", "image_input_type")
+        removed_vision_keys = (
+            "image_token_id",
+            "image_feature_size",
+            "image_input_shape",
+            "image_input_type",
+        )
         if any(k in kwargs for k in removed_vision_keys):
             raise TypeError(
                 "There is no need to pass vision-related arguments anymore.")
@@ -159,27 +170,25 @@ class LLM:
             max_context_len_to_capture=max_context_len_to_capture,
             max_seq_len_to_capture=max_seq_len_to_capture,
             disable_custom_all_reduce=disable_custom_all_reduce,
+            disable_async_output_proc=disable_async_output_proc,
             **kwargs,
         )
         self.llm_engine = AphroditeEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
 
-    def get_tokenizer(
-            self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-        return self.llm_engine.tokenizer.tokenizer
+    def get_tokenizer(self) -> AnyTokenizer:
+        return self.llm_engine.get_tokenizer_group(TokenizerGroup).tokenizer
 
-    def set_tokenizer(
-        self,
-        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
-    ) -> None:
+    def set_tokenizer(self, tokenizer: AnyTokenizer) -> None:
+        tokenizer_group = self.llm_engine.get_tokenizer_group(TokenizerGroup)
+
         # While CachedTokenizer is dynamic, have no choice but
         # compare class name. Misjudgment will arise from
         # user-defined tokenizer started with 'Cached'
         if tokenizer.__class__.__name__.startswith("Cached"):
-            self.llm_engine.tokenizer.tokenizer = tokenizer
+            tokenizer_group.tokenizer = tokenizer
         else:
-            self.llm_engine.tokenizer.tokenizer = get_cached_tokenizer(
-                tokenizer)
+            tokenizer_group.tokenizer = get_cached_tokenizer(tokenizer)
 
     @overload  # LEGACY: single (prompt + optional token ids)
     def generate(
@@ -255,11 +264,12 @@ class LLM:
     ) -> List[RequestOutput]:
         ...
 
-    @deprecate_kwargs("prompts",
-                      "prompt_token_ids",
-                      is_deprecated=lambda: LLM.DEPRECATE_LEGACY,
-                      additional_message="Please use the 'inputs' parameter "
-                      "instead.")
+    @deprecate_kwargs(
+        "prompts",
+        "prompt_token_ids",
+        is_deprecated=lambda: LLM.DEPRECATE_LEGACY,
+        additional_message="Please use the 'inputs' parameter instead.",
+    )
     def generate(
         self,
         prompts: Union[Union[PromptInputs, Sequence[PromptInputs]],
@@ -271,7 +281,7 @@ class LLM:
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         guided_options_request: Optional[Union[LLMGuidedOptions,
-                                               GuidedDecodingRequest]] = None,
+                                               GuidedDecodingRequest]] = None
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -282,17 +292,17 @@ class LLM:
         Args:
             inputs: A list of inputs to generate completions for.
             sampling_params: The sampling parameters for text generation. If
-                None, we use the default sampling parameters. 
-                When it is a single value, it is applied to every prompt. 
-                When it is a list, the list must have the same length as the 
+                None, we use the default sampling parameters.
+                When it is a single value, it is applied to every prompt.
+                When it is a list, the list must have the same length as the
                 prompts and it is paired one by one with the prompt.
             use_tqdm: Whether to use tqdm to display the progress bar.
             lora_request: LoRA request to use for generation, if any.
-            prompt_adapter_request: Prompt Adapter request to use for 
+            prompt_adapter_request: Prompt Adapter request to use for
                 generation, if any.
 
         Returns:
-            A list of `RequestOutput` objects containing the
+            A list of ``RequestOutput`` objects containing the
             generated completions in the same order as the input prompts.
 
         Note:
@@ -330,8 +340,7 @@ class LLM:
             params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
-            guided_options=guided_options_request,
-        )
+            guided_options=guided_options_request)
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return AphroditeEngine.validate_outputs(outputs, RequestOutput)
@@ -345,15 +354,21 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         chat_template: Optional[str] = None,
         add_generation_prompt: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> List[RequestOutput]:
         """
-        Generates responses for chat messages.
-        Converts the messages to prompts using the tokenizer and calls
-        the :meth:`generate` method to generate the responses.
+        Generate responses for a chat conversation.
+
+        The chat conversation is converted into a text prompt using the
+        tokenizer and calls the :meth:`generate` method to generate the
+        responses.
+
+        Multi-modal inputs can be passed in the same way you would pass them
+        to the OpenAI API.
+
         Args:
-            messages: A list of messages to generate responses for. Each
-                message is a list of dictionaries with 'role' and 'content'
-                keys.
+            messages: A single conversation represented as a list of messages.
+                Each message is a dictionary with 'role' and 'content' keys.
             sampling_params: The sampling parameters for text generation.
                 If None, we use the default sampling parameters. When it
                 is a single value, it is applied to every prompt. When it
@@ -363,8 +378,9 @@ class LLM:
             lora_request: LoRA request to use for generation, if any.
             chat_template: The template to use for structuring the chat.
               If not provided, the model's default chat template will be used.
-            add_generation_prompt: If True, adds a generation template 
+            add_generation_prompt: If True, adds a generation template
                 to each message.
+
         Returns:
             A list of ``RequestOutput`` objects containing the generated
             responses in the same order as the input messages.
@@ -373,18 +389,39 @@ class LLM:
         tokenizer = self.get_tokenizer()
         model_config = self.llm_engine.get_model_config()
 
-        conversations, _ = parse_chat_messages(messages, model_config,
-                                               tokenizer)
+        conversation, mm_data = parse_chat_messages(messages, model_config,
+                                                    tokenizer)
 
-        prompts = apply_chat_template(
-            tokenizer,
-            conversations,
-            chat_template=chat_template,
-            add_generation_prompt=add_generation_prompt)
+        prompt: Union[str, List[int]]
+        if isinstance(tokenizer, MistralTokenizer):
+            prompt = apply_mistral_chat_template(
+                tokenizer,
+                messages=messages,
+                chat_template=chat_template,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+            )
+        else:
+            prompt = apply_hf_chat_template(
+                tokenizer,
+                conversation=conversation,
+                chat_template=chat_template,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+            )
+
+        inputs: PromptInputs
+        if is_list_of(prompt, int):
+            inputs = TokensPrompt(prompt_token_ids=prompt)
+        else:
+            inputs = TextPrompt(prompt=prompt)
+
+        if mm_data is not None:
+            inputs["multi_modal_data"] = mm_data
 
         return self.generate(
-            prompts,
-            sampling_params,
+            inputs,
+            sampling_params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
         )
@@ -463,11 +500,12 @@ class LLM:
     ) -> List[EmbeddingRequestOutput]:
         ...
 
-    @deprecate_kwargs("prompts",
-                      "prompt_token_ids",
-                      is_deprecated=lambda: LLM.DEPRECATE_LEGACY,
-                      additional_message="Please use the 'inputs' parameter "
-                      "instead.")
+    @deprecate_kwargs(
+        "prompts",
+        "prompt_token_ids",
+        is_deprecated=lambda: LLM.DEPRECATE_LEGACY,
+        additional_message="Please use the 'inputs' parameter instead.",
+    )
     def encode(
         self,
         prompts: Union[Union[PromptInputs, Sequence[PromptInputs]],
@@ -487,14 +525,13 @@ class LLM:
 
         Args:
             inputs: The inputs to the LLM. You may pass a sequence of inputs for
-                batch inference. See
-                :class:`~aphrodite.inputs.PromptInputs`
+                batch inference. See :class:`~aphrodite.inputs.PromptInputs`
                 for more details about the format of each input.
             pooling_params: The pooling parameters for pooling. If None, we
                 use the default pooling parameters.
             use_tqdm: Whether to use tqdm to display the progress bar.
             lora_request: LoRA request to use for generation, if any.
-            prompt_adapter_request: Prompt Adapter request to use for 
+            prompt_adapter_request: Prompt Adapter request to use for
                 generation, if any.
 
         Returns:
@@ -527,11 +564,11 @@ class LLM:
             inputs=inputs,
             params=pooling_params,
             lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request)
+            prompt_adapter_request=prompt_adapter_request,
+        )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        return AphroditeEngine.validate_outputs(outputs,
-                                                EmbeddingRequestOutput)
+        return AphroditeEngine.validate_outputs(outputs, EmbeddingRequestOutput)
 
     # LEGACY
     def _convert_v1_inputs(
@@ -564,6 +601,8 @@ class LLM:
 
         inputs: List[PromptInputs] = []
         for i in range(num_requests):
+            item: PromptInputs
+
             if prompts is not None:
                 item = TextPrompt(prompt=prompts[i])
             elif prompt_token_ids is not None:
@@ -589,7 +628,6 @@ class LLM:
             inputs = [inputs]
 
         num_requests = len(inputs)
-
         if isinstance(params, list) and len(params) != num_requests:
             raise ValueError("The lengths of prompts and params "
                              "must be the same.")
@@ -598,14 +636,12 @@ class LLM:
             raise ValueError("The lengths of prompts and lora_request "
                              "must be the same.")
 
-        if isinstance(params, list):
-            params = [
-                self._add_guided_processor(param, guided_options)
-                if isinstance(param, SamplingParams) else param
-                for param in params
-            ]
-        elif isinstance(params, SamplingParams):
-            params = self._add_guided_processor(params, guided_options)
+        for sp in params if isinstance(params, list) else (params, ):
+            if isinstance(sp, SamplingParams):
+                self._add_guided_processor(sp, guided_options)
+
+                # We only care about the final output
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
 
         # Add requests to the engine.
         for i, request_inputs in enumerate(inputs):
@@ -618,12 +654,11 @@ class LLM:
             )
 
     def _add_request(
-            self,
-            inputs: PromptInputs,
-            params: Union[SamplingParams, PoolingParams],
-            lora_request: Optional[Union[List[LoRARequest],
-                                         LoRARequest]] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None
+        self,
+        inputs: PromptInputs,
+        params: Union[SamplingParams, PoolingParams],
+        lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(
@@ -631,7 +666,8 @@ class LLM:
             inputs,
             params,
             lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request)
+            prompt_adapter_request=prompt_adapter_request,
+        )
 
     def _add_guided_processor(
             self,
@@ -664,6 +700,7 @@ class LLM:
                 postfix=(f"est. speed input: {0:.2f} toks/s, "
                          f"output: {0:.2f} toks/s"),
             )
+
         # Run the engine.
         outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
         total_in_toks = 0
@@ -676,16 +713,18 @@ class LLM:
                     if use_tqdm:
                         if isinstance(output, RequestOutput):
                             # Calculate tokens only for RequestOutput
+                            assert output.prompt_token_ids is not None
                             total_in_toks += len(output.prompt_token_ids)
                             in_spd = total_in_toks / pbar.format_dict["elapsed"]
                             total_out_toks += sum(
                                 len(stp.token_ids) for stp in output.outputs)
-                            out_spd = total_out_toks / pbar.format_dict[
-                                "elapsed"]
+                            out_spd = (total_out_toks /
+                                       pbar.format_dict["elapsed"])
                             pbar.postfix = (
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
+
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.

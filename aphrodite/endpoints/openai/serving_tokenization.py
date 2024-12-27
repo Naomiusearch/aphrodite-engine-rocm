@@ -4,12 +4,13 @@ from loguru import logger
 
 from aphrodite.common.config import ModelConfig
 from aphrodite.common.utils import random_uuid
-# yapf conflicts with isort
-# yapf: disable
-from aphrodite.endpoints.chat_utils import (apply_chat_template,
+from aphrodite.endpoints.chat_utils import (apply_hf_chat_template,
+                                            apply_mistral_chat_template,
                                             load_chat_template,
-                                            parse_chat_messages)
+                                            parse_chat_messages_futures)
 from aphrodite.endpoints.logger import RequestLogger
+# yapf conflicts with isort for this block
+# yapf: disable
 from aphrodite.endpoints.openai.protocol import (DetokenizeRequest,
                                                  DetokenizeResponse,
                                                  ErrorResponse,
@@ -20,6 +21,7 @@ from aphrodite.endpoints.openai.protocol import (DetokenizeRequest,
 from aphrodite.endpoints.openai.serving_engine import (LoRAModulePath,
                                                        OpenAIServing)
 from aphrodite.engine.protocol import AsyncEngineClient
+from aphrodite.transformers_utils.tokenizer import MistralTokenizer
 
 
 class OpenAIServingTokenization(OpenAIServing):
@@ -42,7 +44,11 @@ class OpenAIServingTokenization(OpenAIServing):
                          request_logger=request_logger)
 
         # If this is None we use the tokenizer's default chat template
-        self.chat_template = load_chat_template(chat_template)
+        # the list of commonly-used chat template names for HF named templates
+        hf_chat_templates: List[str] = ['default', 'tool_use']
+        self.chat_template = chat_template \
+            if chat_template in hf_chat_templates \
+            else load_chat_template(chat_template)
 
     async def create_tokenize(
         self,
@@ -61,22 +67,32 @@ class OpenAIServingTokenization(OpenAIServing):
 
         tokenizer = await self.async_engine_client.get_tokenizer(lora_request)
 
+        prompt: Union[str, List[int]]
         if isinstance(request, TokenizeChatRequest):
             model_config = self.model_config
 
-            conversation, mm_futures = parse_chat_messages(
+            conversation, mm_data_future = parse_chat_messages_futures(
                 request.messages, model_config, tokenizer)
 
-            if mm_futures:
+            mm_data = await mm_data_future
+            if mm_data:
                 logger.warning(
                     "Multi-modal inputs are ignored during tokenization")
 
-            prompt = apply_chat_template(
-                tokenizer,
-                conversation=conversation,
-                chat_template=self.chat_template,
-                add_generation_prompt=request.add_generation_prompt,
-            )
+            if isinstance(tokenizer, MistralTokenizer):
+                prompt = apply_mistral_chat_template(
+                    tokenizer,
+                    messages=request.messages,
+                    chat_template=self.chat_template,
+                    add_generation_prompt=request.add_generation_prompt,
+                )
+            else:
+                prompt = apply_hf_chat_template(
+                    tokenizer,
+                    conversation=conversation,
+                    chat_template=self.chat_template,
+                    add_generation_prompt=request.add_generation_prompt,
+                )
         else:
             prompt = request.prompt
 

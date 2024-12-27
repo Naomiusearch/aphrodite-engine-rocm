@@ -1,4 +1,6 @@
 import asyncio
+import os
+import pickle
 import signal
 from typing import Any, Coroutine, Union
 
@@ -7,6 +9,8 @@ import zmq
 import zmq.asyncio
 from loguru import logger
 from typing_extensions import Never
+from zmq import Frame  # type: ignore[attr-defined]
+from zmq.asyncio import Socket
 
 from aphrodite import AsyncAphrodite, AsyncEngineArgs
 from aphrodite.common.config import (DecodingConfig, LoRAConfig, ModelConfig,
@@ -38,7 +42,7 @@ class AsyncEngineRPCServer:
         self.context = zmq.asyncio.Context()
 
         # Init socket.
-        self.socket = self.context.socket(zmq.constants.DEALER)
+        self.socket: Socket = self.context.socket(zmq.constants.DEALER)
         self.socket.set_hwm(APHRODITE_RPC_ZMQ_HWM)
         self.socket.connect(rpc_path)
 
@@ -46,7 +50,6 @@ class AsyncEngineRPCServer:
         """Cleanup all resources."""
         self.socket.close()
         self.context.destroy()
-        self.engine.shutdown_background_loop()
         # Clear the engine reference so that it can be GC'ed.
         self.engine = None
 
@@ -66,23 +69,24 @@ class AsyncEngineRPCServer:
             else:
                 raise ValueError(f"Unknown Config Request: {request}")
 
-            await self.socket.send_multipart(
-                [identity, cloudpickle.dumps(config)])
+            await self.socket.send_multipart((identity, pickle.dumps(config)),
+                                             copy=False)
 
         except Exception as e:
-            await self.socket.send_multipart([identity, cloudpickle.dumps(e)])
+            await self.socket.send_multipart((identity, pickle.dumps(e)),
+                                             copy=False)
 
     async def do_log_stats(self, identity):
         """Log stats and confirm success."""
         await self.engine.do_log_stats()
 
         await self.socket.send_multipart(
-            [identity, cloudpickle.dumps(APHRODITE_RPC_SUCCESS_STR)])
+            (identity, pickle.dumps(APHRODITE_RPC_SUCCESS_STR)))
 
     async def is_server_ready(self, identity):
         """Notify the client that we are ready."""
         await self.socket.send_multipart(
-            [identity, cloudpickle.dumps(APHRODITE_RPC_SUCCESS_STR)])
+            (identity, pickle.dumps(APHRODITE_RPC_SUCCESS_STR)))
 
     async def abort(self, identity, request: RPCAbortRequest):
         """Abort request and notify the client of success."""
@@ -92,7 +96,7 @@ class AsyncEngineRPCServer:
             result: Union[str, Exception] = APHRODITE_RPC_SUCCESS_STR
         except Exception as e:
             result = e
-        await self.socket.send_multipart([identity, cloudpickle.dumps(result)])
+        await self.socket.send_multipart((identity, pickle.dumps(result)))
 
     async def generate(self, identity, generate_request: RPCGenerateRequest):
         try:
@@ -105,25 +109,27 @@ class AsyncEngineRPCServer:
 
             async for request_output in results_generator:
                 await self.socket.send_multipart(
-                    [identity, cloudpickle.dumps(request_output)])
+                    (identity, pickle.dumps(request_output)), copy=False)
 
         except Exception as e:
-            ### Notify client of all failures
-            await self.socket.send_multipart([identity, cloudpickle.dumps(e)])
+            await self.socket.send_multipart((identity, pickle.dumps(e)),
+                                             copy=False)
 
     async def check_health(self, identity):
         try:
             await self.engine.check_health()
             await self.socket.send_multipart(
-                [identity, cloudpickle.dumps(APHRODITE_RPC_SUCCESS_STR)])
+                (identity, pickle.dumps(APHRODITE_RPC_SUCCESS_STR)))
+
         except Exception as e:
-            await self.socket.send_multipart([identity, cloudpickle.dumps(e)])
+            await self.socket.send_multipart((identity, pickle.dumps(e)),
+                                             copy=False)
 
     def _make_handler_coro(self, identity,
-                           message) -> Coroutine[Any, Any, Never]:
+                           message: Frame) -> Coroutine[Any, Any, Never]:
         """Route the zmq message to the handler coroutine."""
 
-        request = cloudpickle.loads(message)
+        request = cloudpickle.loads(message.buffer)
 
         if isinstance(request, RPCGenerateRequest):
             return self.generate(identity, request)
@@ -146,6 +152,8 @@ class AsyncEngineRPCServer:
                 return self.is_server_ready(identity)
             elif request == RPCUtilityRequest.IS_SERVER_HEALTHY:
                 return self.check_health(identity)
+            elif request == RPCUtilityRequest.SHUTDOWN_SERVER:
+                return self.shutdown(identity)
             else:
                 raise ValueError(f"Unknown RPCUtilityRequest type: {request}")
 
@@ -158,7 +166,7 @@ class AsyncEngineRPCServer:
         running_tasks = set()
         while True:
             # Wait for a request.
-            identity, message = await self.socket.recv_multipart()
+            identity, message = await self.socket.recv_multipart(copy=False)
 
             # Process the request async.
             task = asyncio.create_task(
@@ -170,6 +178,28 @@ class AsyncEngineRPCServer:
             # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
             running_tasks.add(task)
             task.add_done_callback(running_tasks.discard)
+
+    async def shutdown(self, identity):
+        """Handle shutdown request from client."""
+        try:
+            # Clean shutdown of engine
+            self.engine.shutdown_background_loop()
+            await self.socket.send_multipart(
+                [identity, cloudpickle.dumps(APHRODITE_RPC_SUCCESS_STR)]
+            )
+        except Exception as e:
+            await self.socket.send_multipart([identity, cloudpickle.dumps(e)])
+        finally:
+            # Schedule server shutdown
+            asyncio.create_task(self._delayed_shutdown())
+    
+    async def _delayed_shutdown(self):
+        """Helper to shut down server after response is sent"""
+        await asyncio.sleep(1)
+        self.cleanup()
+        # Force exit the process
+        os._exit(0)
+
 
 
 async def run_server(server: AsyncEngineRPCServer):
@@ -194,6 +224,11 @@ async def run_server(server: AsyncEngineRPCServer):
         server.cleanup()
 
 
-def run_rpc_server(async_engine_args: AsyncEngineArgs, rpc_path: str):
+def run_rpc_server(async_engine_args: AsyncEngineArgs,
+                   rpc_path: str):
+    def signal_handler(*_) -> None:
+        # Interrupt server on sigterm while initializing
+        raise KeyboardInterrupt("AsyncEngineRPCServer terminated")
+    signal.signal(signal.SIGTERM, signal_handler)
     server = AsyncEngineRPCServer(async_engine_args, rpc_path)
     uvloop.run(run_server(server))

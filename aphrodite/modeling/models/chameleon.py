@@ -11,8 +11,7 @@ from transformers import ChameleonConfig, ChameleonVQVAEConfig
 
 from aphrodite.attention import Attention, AttentionMetadata
 from aphrodite.common.config import CacheConfig, MultiModalConfig
-from aphrodite.common.sequence import (IntermediateTensors, SamplerOutput,
-                                       SequenceData)
+from aphrodite.common.sequence import IntermediateTensors, SequenceData
 from aphrodite.common.utils import print_warning_once
 from aphrodite.constants import APHRODITE_TOKEN_ID_ARRAY_TYPE
 from aphrodite.distributed import get_tensor_model_parallel_world_size
@@ -24,7 +23,7 @@ from aphrodite.modeling.layers.linear import (MergedColumnParallelLinear,
                                               RowParallelLinear)
 from aphrodite.modeling.layers.logits_processor import LogitsProcessor
 from aphrodite.modeling.layers.rotary_embedding import get_rope
-from aphrodite.modeling.layers.sampler import Sampler
+from aphrodite.modeling.layers.sampler import Sampler, SamplerOutput
 from aphrodite.modeling.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from aphrodite.modeling.model_loader.weight_utils import (
@@ -51,7 +50,7 @@ CHAMELEON_SEP_TOKEN_ID = 8710
 class ChameleonImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
     data: torch.Tensor
-    """Shape: `(batch_size, num_channels, height, width)`"""
+    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
 
 
 def get_max_chameleon_image_tokens(ctx: InputContext):
@@ -943,6 +942,9 @@ class ChameleonForConditionalGeneration(nn.Module, SupportsMultiModal):
         if not isinstance(pixel_values, torch.Tensor):
             raise ValueError("Incorrect type of pixel values. "
                              f"Got type: {type(pixel_values)}")
+
+        # Remove the N dimension until multiple images are supported.
+        pixel_values = pixel_values.squeeze(1)
 
         return ChameleonImagePixelInputs(
             type="pixel_values",

@@ -1,6 +1,6 @@
 """Sampling parameters for text generation."""
 import copy
-from enum import IntEnum
+from enum import Enum, IntEnum
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
@@ -10,6 +10,7 @@ from loguru import logger
 from typing_extensions import Annotated
 
 import aphrodite.common.envs as envs
+from aphrodite.common.config import SchedulerConfig
 
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
@@ -22,6 +23,15 @@ class SamplingType(IntEnum):
     RANDOM = 1
     RANDOM_SEED = 2
     BEAM = 3
+
+
+class RequestOutputKind(Enum):
+    # Return entire output so far in every RequestOutput
+    CUMULATIVE = 0
+    # Return only deltas in each RequestOutput
+    DELTA = 1
+    # Do not return intermediate RequestOuputs
+    FINAL_ONLY = 2
 
 class SamplerID(IntEnum):
     # Mirror these in aphrodite/modeling/layers/sampler.py
@@ -276,6 +286,7 @@ class SamplingParams(
     dry_range: int = 0
     skew: float = 0.0
     sampler_priority: Optional[List[int]] = []
+    output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
     # The below fields are not supposed to be used as an input.
     # They are set in post_init.
     output_text_buffer_length: int = 0
@@ -330,6 +341,7 @@ class SamplingParams(
         "dry_range": 0,
         "skew": 0.0,
         "sampler_priority": [],
+        "output_kind": RequestOutputKind.CUMULATIVE,
     }
 
     def __post_init__(self) -> None:
@@ -512,6 +524,10 @@ class SamplingParams(
                     f"{missing_names}"
                 )
 
+        if self.best_of != self.n and self.output_kind == (
+                RequestOutputKind.DELTA):
+            raise ValueError("best_of must equal n to use output_kind=DELTA")
+
     def _verify_beam_search(self) -> None:
         if self.best_of == 1:
             raise ValueError("best_of must be greater than 1 when using beam "
@@ -546,6 +562,15 @@ class SamplingParams(
             raise ValueError("top_p must be 1 when using greedy sampling.")
         if self.top_k != -1:
             raise ValueError("top_k must be -1 when using greedy sampling.")
+
+    def _verify_with_scheduler_config(
+            self, scheduler_config: "SchedulerConfig") -> None:
+        if scheduler_config.single_user_mode:
+            if self.n > 1:
+                raise ValueError("n must be 1 in single user mode.")
+            if self.use_beam_search:
+                raise ValueError(
+                    "beam search is not supported in single user mode.")
 
     def update_from_generation_config(
             self,
